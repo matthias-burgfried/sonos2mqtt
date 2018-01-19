@@ -3,9 +3,8 @@
 const pkg = require('../package.json')
 const log = require('yalm')
 const config = require('./config.js')
-const parser = require('xml2json')
 const mqtt = require('mqtt')
-const s = require('sonos')
+const SONOS = require('sonos')
 
 let mqttClient
 let search
@@ -54,46 +53,45 @@ function start () {
 
   // Start searching for devices
   log.info('Start searching for Sonos players')
-  search = s.search({timeout: 4000})
+  search = SONOS.DeviceDiscovery({timeout: 4000})
   search.on('DeviceAvailable', (device, model) => {
     log.debug('Found device (%s) with IP: %s', model, device.host)
 
-    device.getZoneAttrs((err, attrs) => {
-      if (err) {
-        log.error('Get Zone error ', err)
-        return
-      }
-      // log.info('Found: ' + host.name + ' with IP: ' + host.ip)
+    device.getZoneAttrs().then(attrs => {
       log.info('Found player (%s): %s with IP: %s', model, attrs.CurrentZoneName, device.host)
       device.name = attrs.CurrentZoneName
       // hosts.push(host)
       addDevice(device)
+    }).catch(err => {
+      log.error('Get Zone error ', err)
     })
   })
+
   search.on('timeout', () => {
     publishConnectionStatus()
   })
 
+  SONOS.Listener.on('AlarmClock', result => {
+    log.debug('Alarms changed (or loaded for the first time)')
+    listAlarms()
+  })
+
   process.on('SIGINT', () => {
     log.info('Shutting down listeners, please wait')
-    devices.forEach(device => {
-      device.stopListening((err, success) => {
-        if (err) {
-          log.error('Error shutting down listner %j', err)
-          return
-        }
-
-        log.info('Listener shutdown successfully')
-      })
-    })
-    setTimeout(() => {
+    SONOS.Listener.stopListener().then(result => {
+      log.info('Listener shutdown successfully')
       process.exit()
-    }, 1000)
+    }).catch(err => {
+      log.error('Error shutting down listner %j', err)
+      setTimeout(() => {
+        process.exit()
+      }, 2000)
+    })
   })
 }
 
 // This function will receive all incoming messages from MQTT
-function handleIncomingMessage (topic, payload) {
+async function handleIncomingMessage (topic, payload) {
   payload = payload.toString()
   log.debug('Incoming message to %s %j', topic, payload)
 
@@ -103,98 +101,77 @@ function handleIncomingMessage (topic, payload) {
   if (parts[1] === 'set' && parts.length === 4) {
     let device = devices.find((device) => { return device.name.toLowerCase() === parts[2] })
     if (device) {
-      handleDeviceCommand(device, parts[3], payload)
+      return handleDeviceCommand(device, parts[3], payload).catch(err => {
+        log.error('Error handling command %j', err)
+      })
     } else {
       log.error('Device with name %s not found', parts[2])
+      return false
     }
   } else if (parts[1] === 'cmd' && parts.length === 3) {
-    handleGenericCommand(parts[2], payload)
+    return handleGenericCommand(parts[2], payload)
   }
 }
 
 // This function is called when a device command is recognized by 'handleIncomingMessage'
-function handleDeviceCommand (device, command, payload) {
+async function handleDeviceCommand (device, command, payload) {
   log.debug('Incoming device command %s for %s payload %s', command, device.name, payload)
   switch (command) {
     // ------------------ Playback commands
     case 'next':
-      device.next((err, res) => {
-        log.debug([err, res])
-      })
-      break
+      return device.next()
     case 'pause':
     case 'pauze':
-      device.pause((err, res) => {
-        log.debug([err, res])
-      })
-      break
+      return device.pause()
     case 'play':
-      device.play((err, res) => {
-        log.debug([err, res])
-      })
-      break
+      return device.play()
     case 'previous':
-      device.previous((err, res) => {
-        log.debug([err, res])
-      })
-      break
+      return device.previous()
     case 'stop':
-      device.stop((err, res) => {
-        log.debug([err, res])
-      })
-      break
+      return device.stop()
     // ------------------ Volume commands
     case 'volume':
       if (IsNumeric(payload)) {
         var vol = parseInt(payload)
         if (vol >= 0 && vol <= 100) {
-          device.setVolume(vol, (err, success) => {
-            if (!err && success) {
-              log.info('Changed volume to %d', vol)
-            }
+          return device.setVolume(vol).then(res => {
+            log.info('Changed volume to %d', vol)
           })
         }
       } else {
         log.error('Payload for setting volume is not numeric')
+        return false
       }
       break
     case 'volumeup':
-      handleVolumeCommand(device, payload, 1)
-      break
+      return handleVolumeCommand(device, payload, 1)
     case 'volumedown':
-      handleVolumeCommand(device, payload, -1)
-      break
+      return handleVolumeCommand(device, payload, -1)
     case 'mute':
-      device.setMuted(true, (err, res) => {
-        log.debug([err, res])
-      })
-      break
+      return device.setMuted(true)
     case 'unmute':
-      device.setMuted(false, (err, res) => {
-        log.debug([err, res])
-      })
-      break
+      return device.setMuted(false)
     // ------------------ Sleeptimer
     case 'sleep':
       if (IsNumeric(payload)) {
         var minutes = parseInt(payload)
         if (minutes > 0 && minutes < 1000) {
-          device.configureSleepTimer(minutes, (err, success) => {
-            log.debug('Sleeptimer set %j', [err, success])
-          })
+          return device.configureSleepTimer(minutes)
         }
       } else {
         log.error('Payload for setting sleeptimer is not numeric')
+        return false
       }
       break
     default:
       log.debug('Command %s not yet supported', command)
       break
   }
+  return false
 }
 
  // This function is used by 'handleDeviceCommand' for handeling the volume up/down commands
-function handleVolumeCommand (device, payload, modifier) {
+async function handleVolumeCommand (device, payload, modifier) {
   let change = 5
   if (IsNumeric(payload)) {
     let tempIncrement = parseInt(payload)
@@ -202,58 +179,54 @@ function handleVolumeCommand (device, payload, modifier) {
       change = tempIncrement
     }
   }
-  device.getVolume((err, vol) => {
-    if (err) {
-      log.error('Error getting volume', err)
-      return
-    }
-    let newVolume = vol + (change * modifier)
-    device.setVolume(newVolume, (err2, res) => {
-      log.info('Volume modified from %d to %d', vol, newVolume)
-    })
+  let volume = 0
+  let newVolume = 0
+  return device.getVolume().then(vol => {
+    volume = vol
+    newVolume = vol + (change * modifier)
+    return newVolume
+  }).then(device.setVolume).then(result => {
+    log.info('Volume modified from %d to %d', volume, newVolume)
+  }).catch(err => {
+    log.error('Error getting/setting volume', err)
   })
 }
 
 // This function is called when a generic command is recognized by 'handleIncomingMessages'
-function handleGenericCommand (command, payload) {
+async function handleGenericCommand (command, payload) {
   switch (command) {
     // ------------------ Alarms
     case 'listalarms':
-      listAlarms()
-      break
+      return listAlarms()
     // ------------------ Control all devices
     case 'pauseall':
-      devices.forEach(device => {
-        device.pause((err) => {
-          log.debug(err)
-        })
+      let pause = function (device) {
+        return devices.pause()
+      }
+      let pauseAll = devices.map(pause)
+      return Promise.all(pauseAll).catch(err => {
+        log.debug('Error pausing all devices %j', err)
       })
-      break
 
     default:
       log.error('Command %s isn\' implemented', command)
       break
   }
+  return false
 }
 
 // Loading the alarms and publishing them to 'sonos/alarms'
-function listAlarms () {
-  var alarmService = new s.Services.AlarmClock(devices[0].host)
-  alarmService.ListAlarms({}, (err, res) => {
-    if (err) {
-      log.error('Error loading alarms from %s %j', devices[0].host, err)
-      return
-    }
-
-    var alarms = JSON.parse(parser.toJson(res.CurrentAlarmList)).Alarms.Alarm
-
+async function listAlarms () {
+  var alarmService = devices[0].alarmClockService()
+  return alarmService.ListAlarms().then(alarmResult => {
+    log.debug('Got alarms %j', alarmResult.CurrentAlarmList)
     // For better reading we remove the metadata.
-    alarms.forEach(alarm => {
-      delete alarm.ProgramMetaData
-    })
-
-    log.debug('Got alarms %j', alarms)
-    publishData(config.name + '/alarms', alarms)
+    // alarmResult.CurrentAlarmList(alarm => {
+    //   delete alarm.ProgramMetaData
+    // })
+    publishData(config.name + '/alarms', alarmResult.CurrentAlarmList)
+  }).catch(err => {
+    log.error('Error loading alarms from %s %j', devices[0].host, err)
   })
 }
 
@@ -269,16 +242,16 @@ function publishConnectionStatus () {
 // This function is called by the device discovery, used to setup listening for certain events.
 function addDevice (device) {
   // Start listening for those events!
-  device.on('TrackChanged', track => {
+  device.on('CurrentTrack', track => {
     publishCurrentTrack(device, track)
   })
-  device.on('StateChanged', state => {
+  device.on('PlayState', state => {
     publishState(device, state)
   })
-  device.on('Muted', muted => {
+  device.on('Mute', muted => {
     publishMuted(device, muted)
   })
-  device.on('VolumeChanged', volume => {
+  device.on('Volume', volume => {
     publishVolume(device, volume)
   })
 
@@ -308,17 +281,9 @@ function publishCurrentTrack (device, track) {
     publishData(config.name + '/status/' + device.name + '/artist', track.artist, device.name)
     publishData(config.name + '/status/' + device.name + '/album', track.album, device.name)
     publishData(config.name + '/status/' + device.name + '/albumart', track.albumArtURL, device.name)
+    publishData(config.name + '/status/' + device.name + '/trackuri', track.uri, device.name)
   } else {
-    let val = (track && track.title) ? {
-      title: track.title,
-      artist: track.artist,
-      album: track.album,
-      albumArt: track.albumArtURL
-    } : null
-    if (device.lastTrack !== val) {
-      publishData(config.name + '/status/' + device.name + '/track', val, device.name)
-      device.lastTrack = val
-    }
+    publishData(config.name + '/status/' + device.name + '/track', track, device.name)
   }
 }
 
